@@ -75,6 +75,14 @@ type Logger struct {
     // Compress determines if the rotated log files should be compressed
     // using gzip. The default is not to perform compression.
     Compress bool `json:"compress" yaml:"compress"`
+
+    // BeforeRotate, if set, is called just before the current log file is
+    // renamed during a rotation.
+    BeforeRotate RotationHook `json:"-" yaml:"-"`
+
+    // AfterRotate, if set, is called just after the current log file has
+    // been renamed and the new log file has been opened.
+    AfterRotate RotationHook `json:"-" yaml:"-"`
     // contains filtered or unexported fields
 }
 ```
@@ -109,6 +117,43 @@ MaxBackups.  Note that the time encoded in the timestamp is the rotation
 time, which may differ from the last time that file was written to.
 
 If MaxBackups and MaxAge are both 0, no old log files will be deleted.
+
+### Rotation Hooks
+
+`BeforeRotate` and `AfterRotate` let external systems observe rotations. Both
+hooks receive a `RotationEvent`:
+
+``` go
+type RotationEvent struct {
+    // OldName is the backup filename the previous log file was renamed to,
+    // or empty when no file was rotated away.
+    OldName string
+
+    // NewName is the active log filename after the rotation.
+    NewName string
+
+    // Reason explains why the rotation happened ("size" or "manual").
+    Reason RotationReason
+}
+```
+
+`BeforeRotate` runs immediately before the rename and `AfterRotate` runs
+after the rename and the new log file have succeeded.
+
+Hooks run on their own goroutine, so a slow or blocking hook never stalls
+log writes, and a panic inside a hook is recovered so it can neither fail
+the rotation nor crash the process. Hook events for one rotation are
+delivered in order, but callbacks are asynchronous: synchronize inside the
+hook if you need to observe completion.
+
+``` go
+l := &lumberjack.Logger{
+    Filename: "/var/log/myapp/foo.log",
+    AfterRotate: func(e lumberjack.RotationEvent) {
+        // e.OldName is the newly created backup, e.NewName is the active log.
+    },
+}
+```
 
 
 

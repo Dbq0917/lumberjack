@@ -44,6 +44,45 @@ const (
 // ensure we always implement io.WriteCloser
 var _ io.WriteCloser = (*Logger)(nil)
 
+// RotationReason describes why a rotation was triggered.
+type RotationReason string
+
+const (
+	// ReasonSize means the rotation happened because a write would have made
+	// the current log file exceed MaxSize.
+	ReasonSize RotationReason = "size"
+
+	// ReasonManual means the rotation was triggered explicitly through the
+	// Rotate method.
+	ReasonManual RotationReason = "manual"
+)
+
+// RotationEvent describes a single rotation and is handed to the rotation
+// hooks registered on a Logger.
+//
+// OldName is the file being rotated away: when an existing log file is
+// renamed, it holds the backup filename; when there is nothing to rotate
+// (for example Rotate is called before the first write) OldName is empty.
+// NewName is always the active log filename.
+type RotationEvent struct {
+	// OldName is the backup filename the previous log file was renamed to,
+	// or empty when no file was rotated away.
+	OldName string
+
+	// NewName is the active log filename after the rotation.
+	NewName string
+
+	// Reason explains why the rotation happened.
+	Reason RotationReason
+}
+
+// RotationHook is a function called when a log file is rotated.
+//
+// Hooks run asynchronously on their own goroutine, so they never block
+// writes and a panic or error inside a hook cannot fail the rotation. A hook
+// must not modify the event it receives.
+type RotationHook func(event RotationEvent)
+
 // Logger is an io.WriteCloser that writes to the specified filename.
 //
 // Logger opens or creates the logfile on first Write.  If the file exists and
@@ -107,6 +146,16 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
+	// BeforeRotate, if set, is called just before the current log file is
+	// renamed during a rotation. See RotationHook for the guarantees about
+	// hook execution.
+	BeforeRotate RotationHook `json:"-" yaml:"-"`
+
+	// AfterRotate, if set, is called just after the current log file has been
+	// renamed and the new log file has been opened. See RotationHook for the
+	// guarantees about hook execution.
+	AfterRotate RotationHook `json:"-" yaml:"-"`
+
 	size int64
 	file *os.File
 	mu   sync.Mutex
@@ -150,7 +199,7 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	}
 
 	if l.size+writeLen > l.max() {
-		if err := l.rotate(); err != nil {
+		if err := l.rotate(ReasonSize); err != nil {
 			return 0, err
 		}
 	}
@@ -186,17 +235,17 @@ func (l *Logger) close() error {
 func (l *Logger) Rotate() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.rotate()
+	return l.rotate(ReasonManual)
 }
 
 // rotate closes the current file, moves it aside with a timestamp in the name,
 // (if it exists), opens a new file with the original filename, and then runs
 // post-rotation processing and removal.
-func (l *Logger) rotate() error {
+func (l *Logger) rotate(reason RotationReason) error {
 	if err := l.close(); err != nil {
 		return err
 	}
-	if err := l.openNew(); err != nil {
+	if err := l.openNew(reason); err != nil {
 		return err
 	}
 	l.mill()
@@ -205,7 +254,7 @@ func (l *Logger) rotate() error {
 
 // openNew opens a new log file for writing, moving any old log file out of the
 // way.  This methods assumes the file has already been closed.
-func (l *Logger) openNew() error {
+func (l *Logger) openNew(reason RotationReason) error {
 	err := os.MkdirAll(l.dir(), 0755)
 	if err != nil {
 		return fmt.Errorf("can't make directories for new logfile: %s", err)
@@ -219,6 +268,12 @@ func (l *Logger) openNew() error {
 		mode = info.Mode()
 		// move the existing file
 		newname := backupName(name, l.LocalTime)
+		event := RotationEvent{
+			OldName: newname,
+			NewName: name,
+			Reason:  reason,
+		}
+		l.notifyHook(l.BeforeRotate, event)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
@@ -227,6 +282,7 @@ func (l *Logger) openNew() error {
 		if err := chown(name, info); err != nil {
 			return err
 		}
+		l.notifyHook(l.AfterRotate, event)
 	}
 
 	// we use truncate here because this should only get called when we've moved
@@ -239,6 +295,21 @@ func (l *Logger) openNew() error {
 	l.file = f
 	l.size = 0
 	return nil
+}
+
+// notifyHook invokes hook without blocking the writer: the hook runs on its
+// own goroutine and a panic inside it is recovered so it can neither fail the
+// rotation nor crash the process.
+func (l *Logger) notifyHook(hook RotationHook, event RotationEvent) {
+	if hook == nil {
+		return
+	}
+	go func() {
+		defer func() {
+			_ = recover()
+		}()
+		hook(event)
+	}()
 }
 
 // backupName creates a new filename from the given name, inserting a timestamp
@@ -267,21 +338,21 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	filename := l.filename()
 	info, err := osStat(filename)
 	if os.IsNotExist(err) {
-		return l.openNew()
+		return l.openNew("")
 	}
 	if err != nil {
 		return fmt.Errorf("error getting log file info: %s", err)
 	}
 
 	if info.Size()+int64(writeLen) >= l.max() {
-		return l.rotate()
+		return l.rotate(ReasonSize)
 	}
 
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		// if we fail to open the old log file for some reason, just ignore
 		// it and open a new log file.
-		return l.openNew()
+		return l.openNew("")
 	}
 	l.file = file
 	l.size = info.Size()
