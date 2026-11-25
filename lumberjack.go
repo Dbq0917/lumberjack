@@ -16,9 +16,11 @@
 // Lumberjack plays well with any logging package that can write to an
 // io.Writer, including the standard library's log package.
 //
-// Lumberjack assumes that only one process is writing to the output files.
-// Using the same lumberjack configuration from multiple processes on the same
-// machine will result in improper behavior.
+// On Linux, macOS, and the BSDs, lumberjack takes an advisory flock on the
+// log directory while writing, rotating, and cleaning. This coordinates
+// multiple processes that use the same log file: contending writers wait for
+// the lock, and the kernel releases it if the holding process dies. Other
+// platforms still should use a single writer for a shared log.
 package lumberjack
 
 import (
@@ -113,6 +115,7 @@ type Logger struct {
 
 	millCh    chan bool
 	startMill sync.Once
+	millWG    sync.WaitGroup
 }
 
 var (
@@ -143,20 +146,27 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		)
 	}
 
-	if l.file == nil {
-		if err = l.openExistingOrNew(len(p)); err != nil {
-			return 0, err
+	err = withDirectoryLock(l.dir(), func() error {
+		if err := l.refreshOpenFile(); err != nil {
+			return err
 		}
-	}
 
-	if l.size+writeLen > l.max() {
-		if err := l.rotate(); err != nil {
-			return 0, err
+		if l.file == nil {
+			if err := l.openExistingOrNew(len(p)); err != nil {
+				return err
+			}
 		}
-	}
 
-	n, err = l.file.Write(p)
-	l.size += int64(n)
+		if l.size+writeLen > l.max() {
+			if err := l.rotate(); err != nil {
+				return err
+			}
+		}
+
+		n, err = l.file.Write(p)
+		l.size += int64(n)
+		return err
+	})
 
 	return n, err
 }
@@ -165,7 +175,11 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.close()
+	err := l.close()
+	// Do not return until queued removal/compression has finished. The
+	// cleanup routine acquires the same cross-process lock itself.
+	l.millWG.Wait()
+	return err
 }
 
 // close closes the file if it is open.
@@ -186,7 +200,29 @@ func (l *Logger) close() error {
 func (l *Logger) Rotate() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.rotate()
+	return withDirectoryLock(l.dir(), l.rotate)
+}
+
+// refreshOpenFile detects when another process has rotated the active file
+// while this Logger was idle. Writing to the old descriptor would append to a
+// backup or an unlinked file, so close it and reopen the active path.
+func (l *Logger) refreshOpenFile() error {
+	if l.file == nil {
+		return nil
+	}
+
+	currentInfo, err := osStat(l.filename())
+	if err != nil {
+		return l.close()
+	}
+
+	fileInfo, err := l.file.Stat()
+	if err != nil || !os.SameFile(fileInfo, currentInfo) {
+		return l.close()
+	}
+
+	l.size = currentInfo.Size()
+	return nil
 }
 
 // rotate closes the current file, moves it aside with a timestamp in the name,
@@ -218,7 +254,10 @@ func (l *Logger) openNew() error {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
 		// move the existing file
-		newname := backupName(name, l.LocalTime)
+		newname, err := uniqueBackupName(name, l.LocalTime)
+		if err != nil {
+			return err
+		}
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
@@ -232,7 +271,7 @@ func (l *Logger) openNew() error {
 	// we use truncate here because this should only get called when we've moved
 	// the file ourselves. if someone else creates the file in the meantime,
 	// just wipe out the contents.
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, mode)
 	if err != nil {
 		return fmt.Errorf("can't open new logfile: %s", err)
 	}
@@ -245,17 +284,38 @@ func (l *Logger) openNew() error {
 // between the filename and the extension, using the local time if requested
 // (otherwise UTC).
 func backupName(name string, local bool) string {
+	return backupNameAt(name, local, currentTime())
+}
+
+func backupNameAt(name string, local bool, t time.Time) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	ext := filepath.Ext(filename)
 	prefix := filename[:len(filename)-len(ext)]
-	t := currentTime()
 	if !local {
 		t = t.UTC()
 	}
 
 	timestamp := t.Format(backupTimeFormat)
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+}
+
+// uniqueBackupName avoids overwriting another backup when several rotations
+// happen within the same millisecond. The timestamp stays parseable by
+// timeFromName; it is advanced only far enough to find an unused name.
+func uniqueBackupName(name string, local bool) (string, error) {
+	t := currentTime()
+	for {
+		backup := backupNameAt(name, local, t)
+		_, err := osStat(backup)
+		if os.IsNotExist(err) {
+			return backup, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("error checking backup file name: %s", err)
+		}
+		t = t.Add(time.Millisecond)
+	}
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
@@ -305,7 +365,10 @@ func (l *Logger) millRunOnce() error {
 	if l.MaxBackups == 0 && l.MaxAge == 0 && !l.Compress {
 		return nil
 	}
+	return withDirectoryLock(l.dir(), l.millRunOnceLocked)
+}
 
+func (l *Logger) millRunOnceLocked() error {
 	files, err := l.oldLogFiles()
 	if err != nil {
 		return err
@@ -379,6 +442,7 @@ func (l *Logger) millRun() {
 	for range l.millCh {
 		// what am I going to do, log this?
 		_ = l.millRunOnce()
+		l.millWG.Done()
 	}
 }
 
@@ -389,9 +453,12 @@ func (l *Logger) mill() {
 		l.millCh = make(chan bool, 1)
 		go l.millRun()
 	})
+
+	l.millWG.Add(1)
 	select {
 	case l.millCh <- true:
 	default:
+		l.millWG.Done()
 	}
 }
 

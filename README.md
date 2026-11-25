@@ -20,9 +20,10 @@ to which logs are written.
 Lumberjack plays well with any logging package that can write to an
 io.Writer, including the standard library's log package.
 
-Lumberjack assumes that only one process is writing to the output files.
-Using the same lumberjack configuration from multiple processes on the same
-machine will result in improper behavior.
+On Linux, macOS, and the BSDs, lumberjack coordinates multiple processes that
+write to the same log file with an advisory `flock` on the log directory.
+Contending writers wait for the lock, and the kernel releases it if the
+holding process dies. On other platforms, use a single writer for a shared log.
 
 
 **Example**
