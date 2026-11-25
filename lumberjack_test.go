@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -23,7 +24,13 @@ import (
 // that doesn't change unless we want it to.
 var fakeCurrentTime = time.Now()
 
+// fakeTimeMu guards fakeCurrentTime because the background mill goroutine may
+// read the clock while a test advances it via newFakeTime.
+var fakeTimeMu sync.RWMutex
+
 func fakeTime() time.Time {
+	fakeTimeMu.RLock()
+	defer fakeTimeMu.RUnlock()
 	return fakeCurrentTime
 }
 
@@ -758,6 +765,8 @@ func fileCount(dir string, exp int, t testing.TB) {
 
 // newFakeTime sets the fake "current time" to two days later.
 func newFakeTime() {
+	fakeTimeMu.Lock()
+	defer fakeTimeMu.Unlock()
 	fakeCurrentTime = fakeCurrentTime.Add(time.Hour * 24 * 2)
 }
 

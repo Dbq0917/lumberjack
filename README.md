@@ -110,6 +110,15 @@ time, which may differ from the last time that file was written to.
 
 If MaxBackups and MaxAge are both 0, no old log files will be deleted.
 
+### Compressing Old Log Files
+When `Compress` is true, rotated backups are gzip-compressed in a background
+goroutine. Rotation and writes only signal the background work; they never wait
+for compression to finish. A backup that is currently being compressed (and its
+partial `.gz` output) is treated by cleanup as still present, so MaxBackups or
+MaxAge removal never deletes a file mid-compression. If compression fails, the
+original uncompressed backup is left in place. `Close` waits for any queued
+removal/compression work to finish before returning.
+
 
 
 

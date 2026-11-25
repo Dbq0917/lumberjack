@@ -4,6 +4,7 @@ package lumberjack
 
 import (
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -80,8 +81,9 @@ func TestMaintainOwner(t *testing.T) {
 	err = l.Rotate()
 	isNil(err, t)
 
-	equals(555, fakeFS.files[filename].uid, t)
-	equals(666, fakeFS.files[filename].gid, t)
+	uid, gid := fakeFS.owner(filename)
+	equals(555, uid, t)
+	equals(666, gid, t)
 }
 
 func TestCompressMaintainMode(t *testing.T) {
@@ -171,8 +173,9 @@ func TestCompressMaintainOwner(t *testing.T) {
 	// a compressed version of the log file should now exist with the correct
 	// owner.
 	filename2 := backupFile(dir)
-	equals(555, fakeFS.files[filename2+compressSuffix].uid, t)
-	equals(666, fakeFS.files[filename2+compressSuffix].gid, t)
+	uid2, gid2 := fakeFS.owner(filename2 + compressSuffix)
+	equals(555, uid2, t)
+	equals(666, gid2, t)
 }
 
 type fakeFile struct {
@@ -181,6 +184,7 @@ type fakeFile struct {
 }
 
 type fakeFS struct {
+	mu    sync.Mutex
 	files map[string]fakeFile
 }
 
@@ -189,8 +193,19 @@ func newFakeFS() *fakeFS {
 }
 
 func (fs *fakeFS) Chown(name string, uid, gid int) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	fs.files[name] = fakeFile{uid: uid, gid: gid}
 	return nil
+}
+
+// owner returns the recorded uid/gid for name under the fakeFS lock so test
+// reads do not race with background compression calling Chown.
+func (fs *fakeFS) owner(name string) (int, int) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	f := fs.files[name]
+	return f.uid, f.gid
 }
 
 func (fs *fakeFS) Stat(name string) (os.FileInfo, error) {

@@ -113,6 +113,25 @@ type Logger struct {
 
 	millCh    chan bool
 	startMill sync.Once
+	// millWG tracks queued post-rotation work so Close can wait for any
+	// in-flight removal/compression without making Rotate wait.
+	millWG sync.WaitGroup
+
+	// millMu serializes a single scan/retention/claim pass, which makes
+	// millRunOnce safe to invoke concurrently. It is released while claimed
+	// files are actually compressed.
+	millMu sync.Mutex
+
+	// compressMu guards compressing, the set of backup base names currently
+	// being compressed in the background. Retention treats these files (and
+	// their partial .gz output) as still present.
+	compressMu  sync.Mutex
+	compressing map[string]struct{}
+
+	// compress is an optional per-logger compression override for tests that
+	// need a slow or failing compressor without mutating package globals.
+	// When nil, compressFile is used.
+	compress func(src, dst string) error
 }
 
 var (
@@ -121,6 +140,11 @@ var (
 
 	// os_Stat exists so it can be mocked out by tests.
 	osStat = os.Stat
+
+	// compressFile compresses a rotated log file. It is a variable so tests
+	// can inject failing compressors; production uses compressLogFile, which
+	// leaves the original file behind when compression fails.
+	compressFile = compressLogFile
 
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
 	// variable so tests can mock it out and not need to write megabytes of data
@@ -165,7 +189,12 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.close()
+	err := l.close()
+	// Drain queued removal/compression so callers (and tests) observe the
+	// final on-disk state. Rotate itself never waits on this. The mill
+	// goroutines do not take l.mu, so waiting here cannot deadlock.
+	l.millWG.Wait()
+	return err
 }
 
 // close closes the file if it is open.
@@ -306,8 +335,15 @@ func (l *Logger) millRunOnce() error {
 		return nil
 	}
 
+	// Serialize the scan, retention decisions and compression claims. The
+	// lock is released before any (potentially slow) compression runs, so a
+	// concurrent cleanup pass still makes progress and respects the
+	// in-flight markers.
+	l.millMu.Lock()
+
 	files, err := l.oldLogFiles()
 	if err != nil {
+		l.millMu.Unlock()
 		return err
 	}
 
@@ -319,10 +355,7 @@ func (l *Logger) millRunOnce() error {
 		for _, f := range files {
 			// Only count the uncompressed log file or the
 			// compressed log file, not both.
-			fn := f.Name()
-			if strings.HasSuffix(fn, compressSuffix) {
-				fn = fn[:len(fn)-len(compressSuffix)]
-			}
+			fn := backupBaseName(f.Name())
 			preserved[fn] = true
 
 			if len(preserved) > l.MaxBackups {
@@ -356,21 +389,95 @@ func (l *Logger) millRunOnce() error {
 		}
 	}
 
+	// Remove stale files, but never delete a backup that a background
+	// compression is currently reading, nor its partial .gz output. Such a
+	// file is treated by retention as if it were still present.
 	for _, f := range remove {
-		errRemove := os.Remove(filepath.Join(l.dir(), f.Name()))
-		if err == nil && errRemove != nil {
+		base := backupBaseName(f.Name())
+		if l.isCompressing(base) {
+			continue
+		}
+		if errRemove := os.Remove(filepath.Join(l.dir(), f.Name())); err == nil && errRemove != nil {
 			err = errRemove
 		}
 	}
+
+	type compressJob struct {
+		src  string
+		dst  string
+		base string
+	}
+
+	// Claim candidates before releasing millMu so two concurrent passes can
+	// never start compressing the same backup.
+	var jobs []compressJob
 	for _, f := range compress {
 		fn := filepath.Join(l.dir(), f.Name())
-		errCompress := compressLogFile(fn, fn+compressSuffix)
-		if err == nil && errCompress != nil {
-			err = errCompress
+		base := backupBaseName(f.Name())
+		if !l.tryBeginCompress(base) {
+			continue
 		}
+		jobs = append(jobs, compressJob{src: fn, dst: fn + compressSuffix, base: base})
+	}
+	l.millMu.Unlock()
+
+	compressor := l.compress
+	if compressor == nil {
+		compressor = compressFile
+	}
+
+	// Compress outside millMu. In production this runs on the mill goroutine,
+	// so it never blocks writes or Rotate. compressLogFile leaves the source
+	// behind when compression fails; the in-flight marker is always cleared.
+	for _, job := range jobs {
+		func() {
+			defer l.endCompress(job.base)
+			if errCompress := compressor(job.src, job.dst); err == nil && errCompress != nil {
+				err = errCompress
+			}
+		}()
 	}
 
 	return err
+}
+
+// backupBaseName strips the trailing .gz suffix (if present) so a compressed
+// backup and its uncompressed original share one identity.
+func backupBaseName(name string) string {
+	if strings.HasSuffix(name, compressSuffix) {
+		return name[:len(name)-len(compressSuffix)]
+	}
+	return name
+}
+
+// isCompressing reports whether base is currently being compressed.
+func (l *Logger) isCompressing(base string) bool {
+	l.compressMu.Lock()
+	defer l.compressMu.Unlock()
+	_, ok := l.compressing[base]
+	return ok
+}
+
+// tryBeginCompress marks base as an in-progress compression. It returns false
+// if base was already marked, letting concurrent passes deduplicate the work.
+func (l *Logger) tryBeginCompress(base string) bool {
+	l.compressMu.Lock()
+	defer l.compressMu.Unlock()
+	if _, ok := l.compressing[base]; ok {
+		return false
+	}
+	if l.compressing == nil {
+		l.compressing = make(map[string]struct{})
+	}
+	l.compressing[base] = struct{}{}
+	return true
+}
+
+// endCompress clears the in-progress marker for base.
+func (l *Logger) endCompress(base string) {
+	l.compressMu.Lock()
+	defer l.compressMu.Unlock()
+	delete(l.compressing, base)
 }
 
 // millRun runs in a goroutine to manage post-rotation compression and removal
@@ -379,6 +486,7 @@ func (l *Logger) millRun() {
 	for range l.millCh {
 		// what am I going to do, log this?
 		_ = l.millRunOnce()
+		l.millWG.Done()
 	}
 }
 
@@ -389,9 +497,14 @@ func (l *Logger) mill() {
 		l.millCh = make(chan bool, 1)
 		go l.millRun()
 	})
+	// Account for one unit of work. A successful hand-off is balanced by the
+	// worker's Done after millRunOnce; a dropped (coalesced) signal is balanced
+	// here. Close uses this to wait for queued work to finish.
+	l.millWG.Add(1)
 	select {
 	case l.millCh <- true:
 	default:
+		l.millWG.Done()
 	}
 }
 
