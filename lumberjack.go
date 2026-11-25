@@ -39,6 +39,9 @@ const (
 	backupTimeFormat = "2006-01-02T15-04-05.000"
 	compressSuffix   = ".gz"
 	defaultMaxSize   = 100
+
+	removeMaxAttempts  = 3
+	removeRetryBackoff = time.Millisecond
 )
 
 // ensure we always implement io.WriteCloser
@@ -71,9 +74,11 @@ var _ io.WriteCloser = (*Logger)(nil)
 // Whenever a new logfile gets created, old log files may be deleted.  The most
 // recent files according to the encoded timestamp will be retained, up to a
 // number equal to MaxBackups (or all of them if MaxBackups is 0).  Any files
-// with an encoded timestamp older than MaxAge days are deleted, regardless of
-// MaxBackups.  Note that the time encoded in the timestamp is the rotation
-// time, which may differ from the last time that file was written to.
+// with an encoded timestamp older than MaxAge days are also past the age rule.
+// When both rules are configured, a file is deleted only when it is beyond
+// MaxBackups and older than MaxAge. A disabled rule does not restrict deletion.
+// Note that the time encoded in the timestamp is the rotation time, which may
+// differ from the last time that file was written to.
 //
 // If MaxBackups and MaxAge are both 0, no old log files will be deleted.
 type Logger struct {
@@ -90,12 +95,13 @@ type Logger struct {
 	// timestamp encoded in their filename.  Note that a day is defined as 24
 	// hours and may not exactly correspond to calendar days due to daylight
 	// savings, leap seconds, etc. The default is not to remove old log files
-	// based on age.
+	// based on age. When MaxBackups is also positive, a backup must be both
+	// older than MaxAge and beyond MaxBackups before it is removed.
 	MaxAge int `json:"maxage" yaml:"maxage"`
 
 	// MaxBackups is the maximum number of old log files to retain.  The default
-	// is to retain all old log files (though MaxAge may still cause them to get
-	// deleted.)
+	// is to retain all old log files. When MaxAge is also positive, a backup
+	// beyond MaxBackups is removed only after it is older than MaxAge.
 	MaxBackups int `json:"maxbackups" yaml:"maxbackups"`
 
 	// LocalTime determines if the time used for formatting the timestamps in
@@ -121,6 +127,9 @@ var (
 
 	// os_Stat exists so it can be mocked out by tests.
 	osStat = os.Stat
+
+	// osRemove exists so removal failures can be injected by tests.
+	osRemove = os.Remove
 
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
 	// variable so tests can mock it out and not need to write megabytes of data
@@ -298,11 +307,10 @@ func (l *Logger) filename() string {
 }
 
 // millRunOnce performs compression and removal of stale log files.
-// Log files are compressed if enabled via configuration and old log
-// files are removed, keeping at most l.MaxBackups files, as long as
-// none of them are older than MaxAge.
+// Log files are compressed if enabled via configuration and old log files
+// are removed according to the combined MaxBackups and MaxAge retention rules.
 func (l *Logger) millRunOnce() error {
-	if l.MaxBackups == 0 && l.MaxAge == 0 && !l.Compress {
+	if l.MaxBackups <= 0 && l.MaxAge <= 0 && !l.Compress {
 		return nil
 	}
 
@@ -311,45 +319,11 @@ func (l *Logger) millRunOnce() error {
 		return err
 	}
 
-	var compress, remove []logInfo
+	remove, remaining := l.partitionLogFiles(files, currentTime())
 
-	if l.MaxBackups > 0 && l.MaxBackups < len(files) {
-		preserved := make(map[string]bool)
-		var remaining []logInfo
-		for _, f := range files {
-			// Only count the uncompressed log file or the
-			// compressed log file, not both.
-			fn := f.Name()
-			if strings.HasSuffix(fn, compressSuffix) {
-				fn = fn[:len(fn)-len(compressSuffix)]
-			}
-			preserved[fn] = true
-
-			if len(preserved) > l.MaxBackups {
-				remove = append(remove, f)
-			} else {
-				remaining = append(remaining, f)
-			}
-		}
-		files = remaining
-	}
-	if l.MaxAge > 0 {
-		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
-		cutoff := currentTime().Add(-1 * diff)
-
-		var remaining []logInfo
-		for _, f := range files {
-			if f.timestamp.Before(cutoff) {
-				remove = append(remove, f)
-			} else {
-				remaining = append(remaining, f)
-			}
-		}
-		files = remaining
-	}
-
+	var compress []logInfo
 	if l.Compress {
-		for _, f := range files {
+		for _, f := range remaining {
 			if !strings.HasSuffix(f.Name(), compressSuffix) {
 				compress = append(compress, f)
 			}
@@ -357,7 +331,7 @@ func (l *Logger) millRunOnce() error {
 	}
 
 	for _, f := range remove {
-		errRemove := os.Remove(filepath.Join(l.dir(), f.Name()))
+		errRemove := removeLogFile(filepath.Join(l.dir(), f.Name()))
 		if err == nil && errRemove != nil {
 			err = errRemove
 		}
@@ -370,6 +344,79 @@ func (l *Logger) millRunOnce() error {
 		}
 	}
 
+	return err
+}
+
+// partitionLogFiles applies the count and age retention rules together.
+// oldLogFiles returns files sorted newest-first. A backup's compressed and
+// uncompressed names count as one backup for MaxBackups.
+func (l *Logger) partitionLogFiles(files []logInfo, now time.Time) (remove, remaining []logInfo) {
+	if l.MaxBackups <= 0 && l.MaxAge <= 0 {
+		return nil, files
+	}
+
+	ageEnabled := l.MaxAge > 0
+	var cutoff time.Time
+	if ageEnabled {
+		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
+		cutoff = now.Add(-diff)
+	}
+
+	backupRanks := make(map[string]int)
+	nextRank := 0
+
+	for _, f := range files {
+		baseName := backupBaseName(f.Name())
+		rank, known := backupRanks[baseName]
+		if !known {
+			nextRank++
+			rank = nextRank
+			backupRanks[baseName] = rank
+		}
+
+		// A non-positive MaxBackups means there is no count limit. When a
+		// positive limit is set, only backups past that rank satisfy it.
+		countRuleSatisfied := l.MaxBackups <= 0 || rank > l.MaxBackups
+
+		// MaxAge <= 0 means there is no age limit.
+		ageRuleSatisfied := !ageEnabled || f.timestamp.Before(cutoff)
+
+		if countRuleSatisfied && ageRuleSatisfied {
+			remove = append(remove, f)
+		} else {
+			remaining = append(remaining, f)
+		}
+	}
+
+	return remove, remaining
+}
+
+func backupBaseName(name string) string {
+	if strings.HasSuffix(name, compressSuffix) {
+		return name[:len(name)-len(compressSuffix)]
+	}
+	return name
+}
+
+func removeLogFile(name string) error {
+	return removeFileWithRetry(name, osRemove, removeMaxAttempts, removeRetryBackoff)
+}
+
+func removeFileWithRetry(name string, remove func(string) error, maxAttempts int, backoff time.Duration) error {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err = remove(name)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if attempt < maxAttempts && backoff > 0 {
+			time.Sleep(time.Duration(attempt) * backoff)
+		}
+	}
 	return err
 }
 

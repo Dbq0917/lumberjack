@@ -59,12 +59,13 @@ type Logger struct {
     // timestamp encoded in their filename.  Note that a day is defined as 24
     // hours and may not exactly correspond to calendar days due to daylight
     // savings, leap seconds, etc. The default is not to remove old log files
-    // based on age.
+    // based on age. When MaxBackups is also positive, a backup must be both
+    // older than MaxAge and beyond MaxBackups before it is removed.
     MaxAge int `json:"maxage" yaml:"maxage"`
 
     // MaxBackups is the maximum number of old log files to retain.  The default
-    // is to retain all old log files (though MaxAge may still cause them to get
-    // deleted.)
+    // is to retain all old log files. When MaxAge is also positive, a backup
+    // beyond MaxBackups is removed only after it is older than MaxAge.
     MaxBackups int `json:"maxbackups" yaml:"maxbackups"`
 
     // LocalTime determines if the time used for formatting the timestamps in
@@ -104,9 +105,11 @@ at 6:30pm on Nov 11 2016 would use the filename
 Whenever a new logfile gets created, old log files may be deleted.  The most
 recent files according to the encoded timestamp will be retained, up to a
 number equal to MaxBackups (or all of them if MaxBackups is 0).  Any files
-with an encoded timestamp older than MaxAge days are deleted, regardless of
-MaxBackups.  Note that the time encoded in the timestamp is the rotation
-time, which may differ from the last time that file was written to.
+with an encoded timestamp older than MaxAge days are past the age rule. When
+both settings are positive, a backup is deleted only when it is beyond
+MaxBackups and older than MaxAge. Setting only one rule applies that rule
+alone. Note that the time encoded in the timestamp is the rotation time, which
+may differ from the last time that file was written to.
 
 If MaxBackups and MaxAge are both 0, no old log files will be deleted.
 
